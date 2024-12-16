@@ -1,0 +1,825 @@
+---
+title: "Regresión Beta: Clima-Influenza"
+author: "Ana Guibert y Luciana Pianelli"
+date: "`r Sys.Date()`"
+output:
+   html_document:
+     toc: yes
+     code_folding: show
+     toc_float: yes
+     df_print: paged
+     theme: united
+     code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(error = FALSE)
+
+setwd("~/MAESTRIA/2024 EEA/VIDEOS/Dataset influenza")
+```
+
+```{r, echo=FALSE}
+options(digits = 7)
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(betareg)
+library(GGally)
+library(purrr)
+library(yardstick)
+library(broom)
+library(knitr)
+
+```
+
+
+# Preprocesamiento
+
+## Importar datasets
+
+Se procede a importar los datos de influenza.
+
+```{r gripe}
+library(readr)
+gripe <- read.csv("influenza.csv")
+head(gripe)
+colnames(gripe)
+range(gripe$Jahr, na.rm = TRUE)
+
+```
+
+Todos los datos pertenecen a la ciudad de Viena, la información disponible está de 2009 a 2018.
+
+En cuanto a la escala temporal, se tienen datos del año, de la semana, y de la temporada de gripe que va desde la semana 40 de un año hasta la semana 13/14 del siguiente año. Por otro lado tenemos la cantidad de enfermos nuevos que se registran por semana.
+
+Explicación de columnas:
+
+ID: número de identificación                        
+
+BEZEICHNUNG: lugar de muestreo
+
+Grippesaison: temporada de gripe            
+
+Jahr: año correspondiente a la toma de datos. Hay valores entre 2009 y 2018
+
+Kalenderwoche: semana de donde van los datos.         
+
+Neuerkrankungen.pro.Woche: número de enfermos de influenza nuevos por semana.
+
+Schwankungsbreite: rango de fluctuación de enfermos
+
+
+Se procede a importar y analizar el dataset del clima.
+
+En particular, hay un dataset por año,  por lo que se importan y se unifican.
+
+```{r clima}
+clima12 <- read_csv("weather_2012.csv")  
+colnames(clima12)
+
+```
+
+X: número de identificación
+
+month:mes de toma de muestra
+
+day: día de toma de muestra
+
+temp_dailyMin: temperatura mínima del día
+
+temp_minGround: temperatura mínima del suelo
+
+temp_dailyMean: temperatura promedio del día
+
+temp_dailyMax: temperatura máxima del día
+
+temp_7h: temperatura a las 7 horas
+
+temp_14h: temperatura  a las  14 horas
+
+temp_19h: temperatura  a las  19 horas
+
+hum_dailyMean: humedad diaria promedio
+
+hum_7h:humedad  a las  7 horas
+
+hum_14h:humedad  a las  14 horas
+
+hum_19h:humedad  a las  19 horas
+
+sun_hours: horas de sol
+
+skyCover_7h: código de cielo cubierto  a las  7 horas
+
+skyCover_14h: código de cielo cubierto  a las  14 horas
+
+skyCover_19h: código de cielo cubierto  a las  19 horas
+
+wind_degrees: dirección del viento
+
+wind_mSec: velocidad del viento
+
+precip: cantidad de precipitación en mm.
+
+year: año de muestreo
+
+*Importar todos los archivos del clima y juntarlos*
+
+```{r}
+archivos <- list.files(path = "~/MAESTRIA/2024 EEA/VIDEOS/Dataset influenza/weather", pattern = "\\.csv$", full.names = TRUE)
+```
+
+
+```{r}
+clima <- archivos %>%
+  lapply(function(archivo) {
+    datos <- read.csv(archivo)
+    year <- as.numeric(gsub("\\D", "", basename(archivo)))
+    datos <- datos %>% mutate(year = year)
+    datos <- datos %>% mutate(id = paste0(year, "_", X))
+    return(datos)
+  }) %>%
+  bind_rows()  
+
+```
+
+
+```{r}
+# Verificar si hay IDs duplicados
+duplicados <- clima %>% filter(duplicated(id))
+if (nrow(duplicados) > 0) {
+  cat("Se encontraron IDs duplicados:\n")
+  print(duplicados)
+} else {
+  cat("No se encontraron IDs duplicados.\n")
+}
+
+head(clima)
+
+```
+
+
+## Dataset Clima
+
+```{r}
+clima <- clima %>%
+  mutate(
+    date = as.Date(paste(year, month, day, sep = "-")),  
+    week = isoweek(date)                                # Se calcula semana ISO
+  )
+
+clima <- clima %>%
+  select(id, year, month, week, everything(), -X) 
+
+```
+
+
+
+```{r}
+
+summary(clima)
+
+```
+
+Se observa que hay valores de temperatura de más de 100°, lo cual no tiene sentido. Como la máxima registrada se ubica alrededor de 38.5°, se decide poner como límite superior 40°. Si es mayor pasar a nulo.
+
+También se observa que hay temperaturas con valores de -40°. Se impone como límite inferior -15°.
+
+Los valores de humedad varían entre 0 y 100% lo cual es un rango correcto.
+
+Las horas de sol, tienen un máximo esperable
+
+El código de cielo cubierto va de 1 a 10
+
+La dirección del viento va entre 1 y 360°
+
+La velocidad del viento va entre 2.9 a 32.7 m/seg
+
+En cuanto a las precipitaciones se observa un valor negativo, que no puede ser posible y un máximo de 62.2 mm.
+
+```{r}
+clima <- clima %>%
+  mutate(across(starts_with("temp"), 
+                ~ if_else(. > 40 | . < -15, NA_real_, .))) %>%
+  mutate(precip = if_else(precip < 0, 0, precip))
+
+```
+
+
+```{r}
+
+summary(clima)
+
+```
+
+
+```{r}
+variables_a_graficar <- clima %>%
+  select(-id, -year,-month, -week, -day)
+
+clima_long <- variables_a_graficar %>%
+  pivot_longer(
+    cols = -date,  
+    names_to = "variable",
+    values_to = "value"
+  )
+
+graficar_por_prefijo <- function(dataset, prefijo) {
+  columnas <- names(dataset)[grepl(paste0("^", prefijo), names(dataset))]
+  datos_grupo <- dataset %>%
+    select(date, all_of(columnas)) %>%
+    pivot_longer(
+      cols = -date, 
+      names_to = "variable",
+      values_to = "value"
+    )
+  
+  # Crear el gráfico
+  ggplot(datos_grupo, aes(x = date, y = value, color = variable)) +
+    geom_line() +
+    theme_minimal() +
+    facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+    labs(
+      title = paste("Variables con prefijo:", prefijo),
+      x = "Date",
+      y = "Value",
+      color = "Variable"
+    )
+}
+
+
+grafico_hum <- graficar_por_prefijo(clima, "hum")
+grafico_temp <- graficar_por_prefijo(clima, "temp")
+grafico_sky <- graficar_por_prefijo(clima, "sky")
+grafico_wind <- graficar_por_prefijo(clima, "wind")
+grafico_precip <- graficar_por_prefijo(clima, "precip")
+
+
+print(grafico_hum)
+print(grafico_temp)
+print(grafico_sky)
+print(grafico_wind)
+print(grafico_precip)
+
+```
+
+
+### Datos faltantes
+
+```{r}
+na_por_columna <- colSums(is.na(clima))
+print(na_por_columna)
+
+```
+
+
+
+### Transformación a semanal
+
+```{r}
+clima <- clima %>%
+  group_by(year, week) %>%            
+  mutate(precip_semanal = sum(precip, na.rm = TRUE)) %>%  
+  ungroup()                           
+
+head(clima)
+```
+
+Como en realidad vamos a querer trabajar con semana, vamos a agrupar los valores diarios por año y semana.
+
+```{r}
+
+clima_weekly <- clima %>%
+  group_by(year, week) %>%
+  summarise(across(where(is.numeric), ~{
+    if (sum(!is.na(.)) == 0) {
+      return(NA)  # Si todos son NA, poner NA
+    } else if (sum(!is.na(.)) == 1) {
+      return(na.omit(.)[1])  # Si solo hay un valor no NA, poner ese valor
+    } else {
+      return(mean(., na.rm = TRUE))  # Promediar, ignorando NA
+    }
+  }, .names = "{.col}_weekly")) %>%
+  ungroup()
+
+head(clima_weekly)
+
+```
+
+
+```{r}
+na_por_columna <- colSums(is.na(clima_weekly))
+print(na_por_columna)
+
+```
+
+
+El único que presenta valores nulos es la dirección del viento. En principio lo vamos a ignorar, ya que creemos que no es determinante para este ánalisis.
+
+Eliminamos algunas variables que no son de utilidad.
+
+```{r}
+
+clima_weekly <- clima_weekly %>% select(-month_weekly, -day_weekly)
+
+```
+
+
+### Datos atípicos
+
+
+```{r}
+graficar_boxplot_por_prefijo <- function(dataset, prefijo) {
+  columnas <- names(dataset)[grepl(paste0("^", prefijo), names(dataset))]
+  datos_grupo <- dataset %>%
+    select(all_of(columnas)) %>%
+    pivot_longer(
+      cols = everything(), 
+      names_to = "variable",
+      values_to = "value"
+    )
+  
+  ggplot(datos_grupo, aes(x = variable, y = value, fill = variable)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(
+      title = paste("Boxplots para variables con prefijo:", prefijo),
+      x = "Variable",
+      y = "Valor",
+      fill = "Variable"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Gráficos por cada prefijo
+boxplot_hum <- graficar_boxplot_por_prefijo(clima_weekly, "hum")
+boxplot_temp <- graficar_boxplot_por_prefijo(clima_weekly, "temp")
+boxplot_sky <- graficar_boxplot_por_prefijo(clima_weekly, "sky")
+boxplot_wind <- graficar_boxplot_por_prefijo(clima_weekly, "wind")
+boxplot_precip <- graficar_boxplot_por_prefijo(clima_weekly, "precip")
+
+# Mostrar los gráficos (uno a la vez en RStudio)
+print(boxplot_hum)
+print(boxplot_temp)
+print(boxplot_sky)
+print(boxplot_wind)
+print(boxplot_precip)
+
+```
+
+
+## Dataset influenza
+
+### Datos atípicos
+
+```{r}
+summary(gripe)
+```
+
+
+Modificar los valores para que sean numéricos:
+
+```{r}
+
+gripe_mod <- gripe %>%
+  mutate(Kalenderwoche = as.numeric(str_remove(Kalenderwoche, "\\. Woche"))) %>%
+  mutate(Neuerkrankungen.pro.Woche = as.numeric(str_replace(Neuerkrankungen.pro.Woche, "-", NA_character_))) %>%
+  mutate(Schwankungsbreite = as.numeric(str_remove(Schwankungsbreite, "\\+/- ")))
+
+```
+
+
+Cambiar nombre de columnas:
+
+```{r}
+gripe_mod <- gripe_mod %>%
+  rename(
+    temporada = Grippesaison,
+    year = Jahr,
+    week = Kalenderwoche,
+    enfermos_semanal = Neuerkrankungen.pro.Woche,
+    rango_fluctuacion = Schwankungsbreite
+  )
+```
+
+
+```{r}
+summary(gripe_mod)
+```
+
+```{r}
+gripe_mod <- gripe_mod %>% mutate(year = ifelse(ID == "2017/2018_51", 2017, year))
+
+```
+
+
+### Agregar variables
+
+```{r}
+# suma total de infectados por temporada
+total_infectados_por_temporada <- gripe_mod %>%
+  group_by(temporada) %>%
+  summarise(total_infectados = sum(enfermos_semanal, na.rm = TRUE))
+
+# Unión del total de infectados por temporada con el dataset original
+gripe_mod <- gripe_mod %>%
+  left_join(total_infectados_por_temporada, by = "temporada") %>%
+  mutate(
+    proporcion = enfermos_semanal / total_infectados
+  ) %>%
+  select(-total_infectados) 
+
+```
+
+Filtrar el dataset por el rango de años y agregar las nuevas columnas
+
+```{r}
+
+gripe_mod <- gripe_mod %>%
+  filter(year >= 2012 & year <= 2018) %>%
+  mutate(
+    cant_enfermos_min = enfermos_semanal - rango_fluctuacion,
+    cant_enfermos_max = enfermos_semanal + rango_fluctuacion
+  )
+
+head(gripe_mod)
+
+```
+
+### Datos nulos
+
+
+```{r}
+summary(gripe_mod)
+```
+
+No hay ningún valor nulo
+
+
+## Unión de los dos datasets
+
+Se procede a la unión de los datasets.
+
+```{r}
+clima_influenza <- left_join(gripe_mod, clima_weekly, by = c("year" = "year", "week" = "week"))
+```
+
+```{r}
+head(clima_influenza)
+```
+
+```{r}
+dim(clima_influenza)
+```
+
+# Modelo
+
+## Correlación
+
+
+```{r}
+
+clima_influenza_num <- clima_influenza %>%
+  select(where(is.numeric)) %>%
+  select(-proporcion)  # Se elimina 'proporcion' para que no se calcule su correlación consigo misma
+
+```
+
+```{r}
+
+correlacion <- cor(clima_influenza$proporcion, clima_influenza_num, use = "complete.obs")
+
+if (is.vector(correlacion)) {
+  tabla_correlacion <- data.frame(
+    Variable = names(clima_influenza_num),
+    Correlacion = as.numeric(correlacion)
+  )
+} else {
+  tabla_correlacion <- data.frame(
+    Variable = colnames(correlacion), 
+    Correlacion = as.numeric(correlacion[1, ]) 
+  )
+}
+
+kable(tabla_correlacion, digits = 3, col.names = c("Variable", "Correlación"))
+
+```
+
+
+Para hacer el gráfico de ggpairs, se seleccionan algunas variables.
+
+```{r}
+
+clima_influenza_num_red <- clima_influenza %>%
+                           select(where(is.numeric)) %>%
+                           select(-enfermos_semanal, -rango_fluctuacion, -cant_enfermos_min, -cant_enfermos_max, -temp_minGround_weekly, -year,-temp_7h_weekly, -temp_14h_weekly, -temp_19h_weekly, -hum_7h_weekly, -hum_14h_weekly, -hum_19h_weekly,-skyCover_14h_weekly, - skyCover_19h_weekly, -wind_degrees_weekly) 
+glimpse(clima_influenza_num_red)
+
+```
+
+
+```{r, progress=FALSE, message=FALSE,  warning=FALSE, fig.width= 12, fig.height=9}
+
+clima_influenza_num_red  %>% select(where(is.numeric)) %>% 
+  ggpairs(upper = list(continuous = wrap("cor", size = 3, hjust=1, alignPercent=0.5)), legend = 25) + 
+  theme_bw() +
+  ggtitle("Correlación entre variables numéricas") +
+  theme(axis.text.x = element_text(angle=-45, vjust=0.5), legend.position = "bottom")
+
+```
+
+
+```{r}
+range(clima_influenza$proporcion, na.rm = TRUE)
+```
+
+```{r}
+dens_proporcion= ggplot(clima_influenza, aes(x = proporcion)) +
+  geom_density(fill = "skyblue", alpha = 0.7) +
+  labs(title = "Densidad de Proporción de infectados de gripe semanalmente ", 
+       x = "Proporción", 
+       y = "Densidad")+
+ theme(plot.caption = element_text(hjust = 0))
+print(dens_proporcion)
+```
+
+
+## Modelo lineal
+
+Se construirán los siguientes modelos
+
+Modelo..............................Variables
+
+mls_temperatura................temp_min
+
+mls_semana.........................week
+
+mlm_temp_semana................temp_min+week
+
+mlm_temp_sem_precip............temp_min+week+precip
+
+mlm_temp_sem_precip_sky........temp_min+week+precip+sky_cover7h
+
+mlm_temp_sem_sky.................temp_min+week+sky_cover7h
+
+mlm_temp_sem_precipS_sky......temp_min+week+precip_semanal+sky_cover7h
+
+
+```{r}
+mls_temperatura <- lm(proporcion ~ temp_dailyMin_weekly, data = clima_influenza)
+summary(mls_temperatura)
+
+```
+
+```{r}
+mls_semana <- lm(proporcion ~ week, data = clima_influenza)
+summary(mls_semana)
+
+```
+
+```{r}
+mlm_temp_semana <- lm(proporcion ~ temp_dailyMin_weekly + week, data = clima_influenza)
+summary(mlm_temp_semana)
+
+```
+
+```{r}
+mlm_temp_sem_precip <- lm(proporcion ~ temp_dailyMin_weekly + week + precip_weekly, data = clima_influenza)
+summary(mlm_temp_sem_precip)
+
+```
+
+```{r}
+mlm_temp_sem_precip_sky <- lm(proporcion ~ temp_dailyMin_weekly + week + precip_weekly +skyCover_7h_weekly, data = clima_influenza)
+summary(mlm_temp_sem_precip_sky)
+
+```
+
+
+```{r}
+mlm_temp_sem_sky <- lm(proporcion ~ temp_dailyMin_weekly + week + skyCover_7h_weekly, data = clima_influenza)
+summary(mlm_temp_sem_sky)
+```
+
+```{r}
+mlm_temp_sem_precipS_sky <- lm(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza)
+summary(mlm_temp_sem_precipS_sky)
+
+```
+
+## Regresión Beta
+
+
+Se construirán los siguientes modelos
+
+Modelo............................Variables
+
+br_temperatura..................temp_min
+
+br_semana.........................week
+
+br_temp_semana...................temp_min+week
+
+br_temp_sem_precip..............temp_min+week+precip
+
+br_temp_sem_precip_sky.........temp_min+week+precip+sky_cover7h
+
+br_temp_sem_sky.................temp_min+week+sky_cover7h
+
+br_temp_sem_precipS_sky.......temp_min+week+precip_semanal+sky_cover7h
+
+```{r}
+br_temperatura <- betareg(proporcion ~ temp_dailyMin_weekly, data = clima_influenza)
+summary(br_temperatura)
+
+```
+
+```{r}
+br_semana <- betareg(proporcion ~ week, data = clima_influenza)
+summary(br_semana)
+
+```
+
+```{r}
+br_temp_semana <- betareg(proporcion ~ temp_dailyMin_weekly + week, data = clima_influenza)
+summary(br_temp_semana)
+
+```
+
+```{r}
+br_temp_sem_precip <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_weekly, data = clima_influenza)
+summary(br_temp_sem_precip)
+
+```
+
+```{r}
+br_temp_sem_precip_sky <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_weekly +skyCover_7h_weekly, data = clima_influenza)
+summary(br_temp_sem_precip_sky)
+
+```
+
+
+```{r}
+br_temp_sem_sky <- betareg(proporcion ~ temp_dailyMin_weekly + week +skyCover_7h_weekly, data = clima_influenza)
+summary(br_temp_sem_sky)
+
+```
+
+
+```{r}
+br_temp_sem_precipS_sky <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza)
+summary(br_temp_sem_precipS_sky)
+
+```
+
+
+```{r}
+plot(br_temp_sem_precipS_sky)
+```
+
+
+## Comparación de modelos
+
+```{r}
+modelos_lista <- list(mls_temperatura=mls_temperatura, br_temperatura = br_temperatura, 
+                     mls_semana=mls_semana,  br_semana = br_semana,
+                    mlm_temp_semana=mlm_temp_semana, br_temp_semana= br_temp_semana, 
+                    mlm_temp_sem_precip=mlm_temp_sem_precip, br_temp_sem_precip=br_temp_sem_precip,
+                    mlm_temp_sem_precip_sky=mlm_temp_sem_precip_sky, br_temp_sem_precip_sky=br_temp_sem_precip_sky,
+                    mlm_temp_sem_sky=mlm_temp_sem_sky, br_temp_sem_sky=br_temp_sem_sky,
+                    mlm_temp_sem_precipS_sky=mlm_temp_sem_precipS_sky, br_temp_sem_precipS_sky=br_temp_sem_precipS_sky)
+```
+
+
+```{r}
+lista_predicciones = map(.x = modelos_lista, .f = augment, newdata = clima_influenza) 
+map_dfr(.x = lista_predicciones, .f = yardstick::rmse, truth = proporcion, estimate = .fitted, .id="modelo") %>% arrange(.estimate)
+
+```
+
+
+```{r}
+map_dfr(.x = lista_predicciones, .f = yardstick::mae, truth = proporcion, estimate = .fitted, .id="modelo") %>% arrange(.estimate)
+```
+
+```{r}
+resultados_aic_bic <- map2_dfr(
+  .x = modelos_lista, 
+  .y = names(modelos_lista), 
+  .f = ~ data.frame(
+    modelo = .y,       
+    AIC = AIC(.x),     
+    BIC = BIC(.x)     
+  )
+) %>%
+  arrange(AIC)  
+
+print(resultados_aic_bic)
+```
+
+
+
+## Funciones link
+
+```{r}
+# Función log-log
+modelo_loglog <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza, link = "loglog")
+summary(modelo_loglog)
+
+# Función clog-log
+modelo_cloglog <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza, link = "cloglog")
+summary(modelo_cloglog)
+
+# Función cauchit
+modelo_cauchit <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza, link = "cauchit")
+summary(modelo_cauchit)
+
+# Función probit
+modelo_probit <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza, link = "probit")
+summary(modelo_probit)
+
+# Función logit
+modelo_logit <- betareg(proporcion ~ temp_dailyMin_weekly + week + precip_semanal_weekly +skyCover_7h_weekly, data = clima_influenza, link = "logit")
+summary(modelo_logit)
+```
+
+
+## Comparación de modelos
+
+```{r}
+modelos_lista_link <- list(mlm_temp_sem_precip_sky=mlm_temp_sem_precipS_sky, br_temp_sem_precip_sky=br_temp_sem_precipS_sky,
+                    modelo_loglog=modelo_loglog,
+                    modelo_cloglog=modelo_cloglog,
+                    modelo_cauchit=modelo_cauchit,
+                    modelo_probit=modelo_probit,
+                    modelo_logit=modelo_logit)
+```
+
+
+```{r}
+lista_predicciones_link = map(.x = modelos_lista_link, .f = augment, newdata = clima_influenza) 
+map_dfr(.x = lista_predicciones_link, .f = yardstick::rmse, truth = proporcion, estimate = .fitted, .id="modelo") %>% arrange(.estimate)
+
+```
+
+```{r}
+map_dfr(.x = lista_predicciones_link, .f = yardstick::mae, truth = proporcion, estimate = .fitted, .id="modelo") %>% arrange(.estimate)
+
+```
+
+```{r}
+resultados_aic_bic <- map2_dfr(
+  .x = modelos_lista_link, 
+  .y = names(modelos_lista_link), 
+  .f = ~ data.frame(
+    modelo = .y,      
+    AIC = AIC(.x),     
+    BIC = BIC(.x)      
+  )
+) %>%
+  arrange(AIC)  
+
+print(resultados_aic_bic)
+```
+
+# Conclusiones
+
+- Es bueno realizar un modelo lineal simple/múltiple para tener como base.
+
+- La exploración de modelos de regresión beta arrojaron que las variables temperatura mínima y la semana son las más influyentes, pero también la precipitación/precipitación acumulada semanal y el cielo cubierto nos ayudan a la predicción
+
+- No quedarse con una sóla métrica para comparar entre modelos
+
+- El Pseudo R2 no es comparable con el R2 /R2 ajustado
+
+- Los modelos de Regresión de Beta presentan un mejor equilibrio entre ajuste y complejidad del modelo
+
+- El análisis de distintas funciones de link está asociado a cómo se distribuyen los datos. En el caso de estudio los datos estaban desplazados hacia valores cercanos a 0 y por ende la mejor función de link es log-log.
+
+# Bibliografía
+
+Abonazel, M. R., Said, H. A., Tag-Eldin, E., Abdel-Rahman, S., & Khattab, I. G. (2023). Using beta regression modeling in medical sciences: a comparative study. Commun. Math. Biol. Neurosci., 2023, Article-ID.
+
+Geissinger, E. A., Khoo, C. L., Richmond, I. C., Faulkner, S. J., & Schneider, D. C. (2022). A case for beta regression in the natural sciences. Ecosphere, 13(2), e3940.
+
+Lu, J., & Meyer, S. (2020). Forecasting flu activity in the United States: benchmarking an endemic-epidemic beta model. International Journal of Environmental Research and Public Health, 17(4), 1381.
+
+Smithson, M., & Verkuilen, J. (2006). A better lemon squeezer? Maximum-likelihood regression with beta-distributed dependent variables. Psychological methods, 11(1), 54.
+
+https://topmodels.r-forge.r-project.org/betareg/vignettes/betareg.html#sec-intro
+
+https://www.kaggle.com/code/kerneler/starter-sickness-and-weather-data-be9ee84b-b/notebook
+
+https://www.3blue1brown.com/lessons/binomial-distributions
+
+https://www.youtube.com/watch?v=8idr1WZ1A7Q
+
+https://inventingsituations.net/2017/01/15/evaluating-success-rates-with-the-beta-distribution/
